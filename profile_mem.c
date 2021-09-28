@@ -17,6 +17,8 @@ typedef struct ProfileMemEntry
 
 PG_FUNCTION_INFO_V1(aqo_profile_mem_hash);
 
+static bool init_profile_shmem(void);
+
 Datum
 aqo_profile_mem_hash(PG_FUNCTION_ARGS)
 {
@@ -29,7 +31,7 @@ aqo_profile_mem_hash(PG_FUNCTION_ARGS)
 	Tuplestorestate *tupstore;
 	MemoryContext per_query_ctx;
 	MemoryContext oldcontext;
-	
+
 	if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -53,7 +55,7 @@ aqo_profile_mem_hash(PG_FUNCTION_ARGS)
 
 	MemoryContextSwitchTo(oldcontext);
 
-	if (!profile_mem_queries)
+	if (!init_profile_shmem())
 	{
 		ReleaseTupleDesc(tupdesc);
 		tuplestore_donestoring(tupstore);
@@ -65,14 +67,14 @@ aqo_profile_mem_hash(PG_FUNCTION_ARGS)
 	while (((entry = (ProfileMemEntry *) hash_seq_search(&hash_seq)) != NULL))
 	{
 		char **values;
-		
+
 		values = (char **) palloc(2 * sizeof(char *));
 		values[0] = (char *) palloc(16 * sizeof(char));
 		values[1] = (char *) palloc(16 * sizeof(char));
-		
+
 		snprintf(values[0], 16, "%d", entry->key);
 		snprintf(values[1], 16, "%0.5f", entry->time);
-		
+
 		tuple = BuildTupleFromCStrings(attinmeta, values);
 		tuplestore_puttuple(tupstore, tuple);
 	}
@@ -83,17 +85,46 @@ aqo_profile_mem_hash(PG_FUNCTION_ARGS)
 	PG_RETURN_VOID();
 }
 
-void
-set_profile_mem(int newval, void *extra)
+/*
+ * Allocate and initialize profiling-related shared memory, if not already
+ * done, and set up backend-local pointer to that state.  Returns false if this
+ * operation was failed.
+ */
+static bool
+init_profile_shmem(void)
 {
-	aqo_profile_mem = newval;
+	if (profile_mem_queries)
+		return true;
+
 	if (aqo_profile_mem > 0)
 	{
 		HASHCTL hash_ctl;
+		int mem_size = (int) (aqo_profile_mem * 1048576 / sizeof(ProfileMemEntry));
+
 		hash_ctl.keysize = sizeof(int);
 		hash_ctl.entrysize = sizeof(ProfileMemEntry);
-		profile_mem_queries = ShmemInitHash("aqo_profile_mem_queries", aqo_profile_mem, aqo_profile_mem, &hash_ctl, HASH_ELEM | HASH_BLOBS);
+		elog(WARNING, "aqo_profile_mem2: %d - %d", aqo_profile_mem, mem_size);
+		profile_mem_queries = ShmemInitHash("aqo_profile_mem_queries",
+											mem_size,
+											mem_size,
+											&hash_ctl,
+											HASH_ELEM | HASH_BLOBS);
+		elog(WARNING, "aqo_profile_mem1: %d", aqo_profile_mem);
 	}
+	return (profile_mem_queries != NULL);
+}
+
+void
+set_profile_mem(int newval, void *extra)
+{
+	if (newval <= 0)
+	{
+		aqo_profile_mem = -1;
+		return;
+	}
+
+	aqo_profile_mem = newval * 1048576; /* calculate size in bytes */
+	elog(WARNING, "Initial shared memory size for AQO profiling hash-table: %d (bytes).", aqo_profile_mem);
 }
 
 void
@@ -103,6 +134,12 @@ update_profile_mem_table(void)
     ProfileMemEntry *pentry;
     double totaltime;
     instr_time endtime;
+
+	if (!init_profile_shmem())
+	{
+		elog(LOG, "Something went wrong during initialization of an AQO profiling hash table. Disable this feature for the backend.");
+		aqo_profile_mem = -1;
+	}
 
     if (aqo_profile_mem > 0)
 	{
@@ -115,10 +152,12 @@ update_profile_mem_table(void)
 			if (!out_of_memory)
 			{
 				pentry = (ProfileMemEntry *) hash_search(profile_mem_queries, &query_context.query_hash, HASH_ENTER, &found);
-				if (found)
-					pentry->time += totaltime - query_context.query_planning_time;
-				else
-					pentry->time = totaltime - query_context.query_planning_time;
+				if (!found)
+				{
+					elog(WARNING, "Q %d not found!", query_context.query_hash);
+					pentry->time = 0;
+				}
+				pentry->time += totaltime - query_context.query_planning_time;
 			}
 		}
  		PG_CATCH();

@@ -199,7 +199,7 @@ _PG_init(void)
 
 	DefineCustomIntVariable(
 							 "aqo.profile_mem",
-							 NULL,
+							 "Sets the maximum memory to be used for a query profiling hash table, MB",
 							 NULL,
 							 &aqo_profile_mem,
 							 -1,
